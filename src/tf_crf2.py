@@ -21,8 +21,133 @@ from __future__ import division
 from __future__ import print_function
 
 import tensorflow as tf
-from tensorflow_addons.text.crf import crf_decode, crf_log_likelihood
-from tensorflow_addons.utils import keras_utils
+#from tensorflow_addons.utils import keras_utils
+
+TensorLike = tf.types.experimental
+from typing import * 
+
+####
+def crf_decode(
+    potentials, transition_params, sequence_length
+):
+#    potentials: TensorLike, transition_params: TensorLike, sequence_length: TensorLike
+#) -> tf.Tensor:
+    """Decode the highest scoring sequence of tags.
+
+    Args:
+      potentials: A [batch_size, max_seq_len, num_tags] tensor of
+                unary potentials.
+      transition_params: A [num_tags, num_tags] matrix of
+                binary potentials.
+      sequence_length: A [batch_size] vector of true sequence lengths.
+
+    Returns:
+      decode_tags: A [batch_size, max_seq_len] matrix, with dtype `tf.int32`.
+                  Contains the highest scoring tag indices.
+      best_score: A [batch_size] vector, containing the score of `decode_tags`.
+    """
+    if tf.__version__[:3] == "2.4":
+        warnings.warn(
+            "CRF Decoding does not work with KerasTensors in TF2.4. The bug has since been fixed in tensorflow/tensorflow##45534"
+        )
+
+    sequence_length = tf.cast(sequence_length, dtype=tf.int32)
+
+    # If max_seq_len is 1, we skip the algorithm and simply return the
+    # argmax tag and the max activation.
+    def _single_seq_fn():
+        decode_tags = tf.cast(tf.argmax(potentials, axis=2), dtype=tf.int32)
+        best_score = tf.reshape(tf.reduce_max(potentials, axis=2), shape=[-1])
+        return decode_tags, best_score
+
+    def _multi_seq_fn():
+        # Computes forward decoding. Get last score and backpointers.
+        initial_state = tf.slice(potentials, [0, 0, 0], [-1, 1, -1])
+        initial_state = tf.squeeze(initial_state, axis=[1])
+        inputs = tf.slice(potentials, [0, 1, 0], [-1, -1, -1])
+
+        sequence_length_less_one = tf.maximum(
+            tf.constant(0, dtype=tf.int32), sequence_length - 1
+        )
+
+        backpointers, last_score = crf_decode_forward(
+            inputs, initial_state, transition_params, sequence_length_less_one
+        )
+
+        backpointers = tf.reverse_sequence(
+            backpointers, sequence_length_less_one, seq_axis=1
+        )
+
+        initial_state = tf.cast(tf.argmax(last_score, axis=1), dtype=tf.int32)
+        initial_state = tf.expand_dims(initial_state, axis=-1)
+
+        decode_tags = crf_decode_backward(backpointers, initial_state)
+        decode_tags = tf.squeeze(decode_tags, axis=[2])
+        decode_tags = tf.concat([initial_state, decode_tags], axis=1)
+        decode_tags = tf.reverse_sequence(decode_tags, sequence_length, seq_axis=1)
+
+        best_score = tf.reduce_max(last_score, axis=1)
+        return decode_tags, best_score
+
+    if potentials.shape[1] is not None:
+        # shape is statically know, so we just execute
+        # the appropriate code path
+        if potentials.shape[1] == 1:
+            return _single_seq_fn()
+        else:
+            return _multi_seq_fn()
+    else:
+        return tf.cond(
+            tf.equal(tf.shape(potentials)[1], 1), _single_seq_fn, _multi_seq_fn
+        )
+
+def crf_log_likelihood(
+    inputs,
+    tag_indices,
+    sequence_lengths,
+    transition_params = None,
+):
+    """Computes the log-likelihood of tag sequences in a CRF.
+
+    Args:
+      inputs: A [batch_size, max_seq_len, num_tags] tensor of unary potentials
+          to use as input to the CRF layer.
+      tag_indices: A [batch_size, max_seq_len] matrix of tag indices for which
+          we compute the log-likelihood.
+      sequence_lengths: A [batch_size] vector of true sequence lengths.
+      transition_params: A [num_tags, num_tags] transition matrix,
+          if available.
+    Returns:
+      log_likelihood: A [batch_size] `Tensor` containing the log-likelihood of
+        each example, given the sequence of tag indices.
+      transition_params: A [num_tags, num_tags] transition matrix. This is
+          either provided by the caller or created in this function.
+    """
+    inputs = tf.convert_to_tensor(inputs)
+
+    num_tags = inputs.shape[2]
+
+    # cast type to handle different types
+    tag_indices = tf.cast(tag_indices, dtype=tf.int32)
+    sequence_lengths = tf.cast(sequence_lengths, dtype=tf.int32)
+
+    # TODO(windqaq): re-evaluate if `transition_params` can be `None`.
+    if transition_params is None:
+        initializer = tf.keras.initializers.GlorotUniform()
+        transition_params = tf.Variable(
+            initializer([num_tags, num_tags]), "transitions"
+        )
+    transition_params = tf.cast(transition_params, inputs.dtype)
+    sequence_scores = crf_sequence_score(
+        inputs, tag_indices, sequence_lengths, transition_params
+    )
+    log_norm = crf_log_norm(inputs, sequence_lengths, transition_params)
+
+    # Normalize the scores to get the log-likelihood per example.
+    log_likelihood = sequence_scores - log_norm
+    return log_likelihood, transition_params
+
+######
 
 
 #@keras_utils.register_keras_custom_object
